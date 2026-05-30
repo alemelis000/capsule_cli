@@ -1,0 +1,92 @@
+package capsule:cep@1.0.0;
+
+/// Shared data types for the Capsule Execution Protocol (CEP).
+interface types {
+  /// An incoming HTTP request injected into the guest by the host.
+  record http-request {
+    method: string,
+    path: string,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+
+  /// The HTTP response returned by the guest.
+  record http-response {
+    status: u16,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+
+  /// Result rows of a relational query. Values are serialized as strings;
+  /// typed accessors live in the language SDKs.
+  record db-rows {
+    columns: list<string>,
+    rows: list<list<string>>,
+    affected: u64,
+  }
+
+  /// A single vector search match.
+  record vector-match {
+    id: string,
+    score: f32,
+    payload: string,
+  }
+
+  /// Errors surfaced across the host<->sandbox boundary.
+  variant cep-error {
+    /// Permission denied (network whitelist, write disabled, limits...).
+    denied(string),
+    /// Database error.
+    db-error(string),
+    /// Network error.
+    net-error(string),
+    /// Execution exceeded the configured time budget.
+    timeout,
+    /// Unexpected internal error.
+    internal(string),
+  }
+}
+
+/// Capabilities the host exposes to a capsule. Deny-by-default: a capability is
+/// only usable if granted in the capsule manifest.
+interface host {
+  use types.{db-rows, vector-match, http-request, http-response, cep-error};
+
+  /// Run a relational SQL query against the capsule's embedded database.
+  /// Positional params use $1..$n.
+  db-query: func(sql: string, params: list<string>) -> result<db-rows, cep-error>;
+
+  /// K-nearest-neighbour search over a vector collection.
+  vector-search: func(collection: string, embedding: list<f32>, limit: u32)
+    -> result<list<vector-match>, cep-error>;
+
+  /// Insert or replace a vector in a collection.
+  vector-upsert: func(collection: string, id: string, embedding: list<f32>, payload: string)
+    -> result<_, cep-error>;
+
+  /// Perform an outbound HTTP request. The host enforces the domain whitelist
+  /// and injects declared secrets; the sandbox never holds raw credentials.
+  net-fetch: func(method: string, url: string, headers: list<tuple<string, string>>, body: list<u8>)
+    -> result<http-response, cep-error>;
+
+  /// Emit a structured log line that is streamed to the dashboard.
+  log: func(level: string, message: string);
+
+  /// Call another capsule in the same app ("mesh") by its declared name. Resolved in-process by
+  /// the multi-capsule host (v2). Returns `denied` when running as a standalone capsule.
+  call-capsule: func(name: string, req: http-request) -> result<http-response, cep-error>;
+}
+
+/// The capsule (guest) implements this: a single HTTP handler.
+interface guest {
+  use types.{http-request, http-response};
+
+  handle: func(req: http-request) -> http-response;
+}
+
+/// The world a capsule component targets: it imports host capabilities and
+/// exports the request handler.
+world capsule {
+  import host;
+  export guest;
+}
