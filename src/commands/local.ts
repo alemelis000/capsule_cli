@@ -1,4 +1,5 @@
 import { createServer, type IncomingHttpHeaders } from "node:http";
+import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,6 +21,8 @@ export interface LocalDeployOptions {
   runtime?: "js" | "python";
   host?: string;
   port?: string;
+  adapter?: "auto" | "wasm" | "frontend" | "static";
+  command?: string;
 }
 
 export interface LocalRemoveOptions {
@@ -34,13 +37,25 @@ interface PreparedProject {
 
 interface InstanceMetadata {
   name: string;
-  type: "agent" | "platform";
-  runtime: "js" | "python";
+  type: string;
+  runtime: string;
   source: string;
   url: string;
   port: number;
   pid: number;
   updatedAt: string;
+}
+
+interface FrontendInstance {
+  dir: string;
+  name: string;
+  kind: string;
+  command: string;
+}
+
+interface StaticInstance {
+  dir: string;
+  name: string;
 }
 
 export async function localDeployCommand(
@@ -51,6 +66,24 @@ export async function localDeployCommand(
   const port = Number.parseInt(opts.port ?? "8787", 10);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error("--port must be a valid TCP port");
+  }
+
+  const localTarget = path.resolve(source ?? process.cwd());
+  const staticInstance = await detectStaticInstance(localTarget, opts);
+  if (staticInstance && opts.adapter === "static") {
+    await runStaticInstance(staticInstance, opts, host, port, source);
+    return;
+  }
+
+  const frontendInstance = await detectFrontendInstance(localTarget, opts, host, port);
+  if (frontendInstance) {
+    await runFrontendInstance(frontendInstance, opts, host, port, source);
+    return;
+  }
+
+  if (staticInstance && opts.adapter !== "wasm") {
+    await runStaticInstance(staticInstance, opts, host, port, source);
+    return;
   }
 
   const prepared = await prepareProject(source ?? process.cwd(), opts);
@@ -140,6 +173,128 @@ export async function localDeployCommand(
   }
 }
 
+async function runFrontendInstance(
+  instance: FrontendInstance,
+  _opts: LocalDeployOptions,
+  host: string,
+  port: number,
+  source: string | undefined,
+): Promise<void> {
+  const instanceDir = path.join(instancesDir(), instance.name);
+  const url = `http://${host}:${port}`;
+  await fs.mkdir(instanceDir, { recursive: true });
+
+  const command = instance.command
+    .replaceAll("{host}", host)
+    .replaceAll("{port}", String(port))
+    .replaceAll("{url}", url);
+
+  console.log(kleur.gray(`starting ${instance.kind} frontend instance ${instance.name}...`));
+  console.log(kleur.gray("  command:  ") + command);
+
+  const child = spawn(command, {
+    cwd: instance.dir,
+    shell: true,
+    stdio: "inherit",
+    env: {
+      ...process.env,
+      BROWSER: "none",
+      HOST: host,
+      PORT: String(port),
+    },
+  });
+
+  await writeInstanceMetadata(instanceDir, {
+    name: instance.name,
+    type: "frontend",
+    runtime: instance.kind,
+    source: path.resolve(source ?? process.cwd()),
+    url,
+    port,
+    pid: child.pid ?? process.pid,
+    updatedAt: new Date().toISOString(),
+  });
+
+  console.log(kleur.green("✓") + ` Local frontend ${kleur.bold(instance.name)} is starting`);
+  console.log(kleur.gray("  url:      ") + kleur.cyan(url));
+  console.log(kleur.gray("  data:     ") + instanceDir);
+  console.log(kleur.gray("  stop:     ") + "Ctrl+C");
+
+  await new Promise<void>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code && code !== 0) reject(new Error(`frontend command exited with ${code}`));
+      else resolve();
+    });
+    const shutdown = () => {
+      if (!child.killed) child.kill();
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+  });
+}
+
+async function runStaticInstance(
+  instance: StaticInstance,
+  _opts: LocalDeployOptions,
+  host: string,
+  port: number,
+  source: string | undefined,
+): Promise<void> {
+  const instanceDir = path.join(instancesDir(), instance.name);
+  const url = `http://${host}:${port}`;
+  await fs.mkdir(instanceDir, { recursive: true });
+
+  const server = createServer(async (req, res) => {
+    const pathname = decodeURIComponent(new URL(req.url ?? "/", url).pathname);
+    const requested = path.normalize(path.join(instance.dir, pathname));
+    const root = path.resolve(instance.dir);
+    if (!requested.startsWith(root)) {
+      res.statusCode = 403;
+      res.end("Forbidden");
+      return;
+    }
+
+    const file = await resolveStaticFile(requested, root);
+    if (!file) {
+      res.statusCode = 404;
+      res.end("Not found");
+      return;
+    }
+
+    res.setHeader("content-type", contentType(file));
+    res.end(await fs.readFile(file));
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => resolve());
+  });
+
+  await writeInstanceMetadata(instanceDir, {
+    name: instance.name,
+    type: "frontend",
+    runtime: "static",
+    source: path.resolve(source ?? process.cwd()),
+    url,
+    port,
+    pid: process.pid,
+    updatedAt: new Date().toISOString(),
+  });
+
+  console.log(kleur.green("✓") + ` Local static frontend ${kleur.bold(instance.name)} is running`);
+  console.log(kleur.gray("  url:      ") + kleur.cyan(url));
+  console.log(kleur.gray("  root:     ") + instance.dir);
+  console.log(kleur.gray("  data:     ") + instanceDir);
+  console.log(kleur.gray("  stop:     ") + "Ctrl+C");
+
+  await new Promise<void>((resolve) => {
+    const shutdown = () => server.close(() => resolve());
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+  });
+}
+
 export async function localListCommand(): Promise<void> {
   const dir = instancesDir();
   const entries = await fs.readdir(dir).catch(() => []);
@@ -208,6 +363,161 @@ async function prepareProject(source: string, opts: LocalDeployOptions): Promise
   };
 }
 
+async function detectFrontendInstance(
+  full: string,
+  opts: LocalDeployOptions,
+  host: string,
+  port: number,
+): Promise<FrontendInstance | undefined> {
+  if (opts.adapter === "wasm" || opts.adapter === "static") return undefined;
+
+  const stat = await fs.stat(full).catch(() => undefined);
+  if (!stat?.isDirectory()) return undefined;
+
+  const packageFile = path.join(full, "package.json");
+  const pkg = await readJson<{
+    name?: string;
+    scripts?: Record<string, string>;
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+  }>(packageFile);
+  if (!pkg && !opts.command) return undefined;
+
+  const name = opts.name ?? sanitizeName(pkg?.name ?? inferName(full));
+  if (opts.command) {
+    return { dir: full, name, kind: "custom", command: opts.command };
+  }
+
+  const deps = { ...(pkg?.dependencies ?? {}), ...(pkg?.devDependencies ?? {}) };
+  const scripts = pkg?.scripts ?? {};
+  const command = frameworkCommand(deps, scripts, host, port) ?? scriptCommand(scripts, host, port);
+  if (!command) return undefined;
+
+  return { dir: full, name, kind: detectFrontendKind(deps, scripts), command };
+}
+
+async function detectStaticInstance(
+  full: string,
+  opts: LocalDeployOptions,
+): Promise<StaticInstance | undefined> {
+  if (opts.adapter === "wasm" || opts.command) return undefined;
+
+  const stat = await fs.stat(full).catch(() => undefined);
+  if (stat?.isFile() && path.basename(full).toLowerCase().endsWith(".html")) {
+    return { dir: path.dirname(full), name: opts.name ?? sanitizeName(path.parse(full).name) };
+  }
+  if (!stat?.isDirectory()) return undefined;
+
+  const candidates = [path.join(full, "index.html"), path.join(full, "public", "index.html")];
+  for (const candidate of candidates) {
+    if (await exists(candidate)) {
+      return {
+        dir: path.dirname(candidate),
+        name: opts.name ?? sanitizeName(path.basename(full)),
+      };
+    }
+  }
+  return undefined;
+}
+
+function frameworkCommand(
+  deps: Record<string, string>,
+  scripts: Record<string, string>,
+  host: string,
+  port: number,
+): string | undefined {
+  if (deps.expo || deps["expo-router"]) return `npx expo start --web --port ${port} --host ${host}`;
+  if (deps.next) return scriptOrBin(scripts, "dev", "next dev", `-H ${host} -p ${port}`);
+  if (deps.vite || deps["@vitejs/plugin-react"] || deps["@vitejs/plugin-vue"]) {
+    return scriptOrBin(scripts, "dev", "vite", `--host ${host} --port ${port}`);
+  }
+  if (deps.astro) return scriptOrBin(scripts, "dev", "astro dev", `--host ${host} --port ${port}`);
+  if (deps.nuxt || deps["nuxt3"]) return scriptOrBin(scripts, "dev", "nuxt dev", `--host ${host} --port ${port}`);
+  if (deps["@sveltejs/kit"] || deps.svelte) {
+    return scriptOrBin(scripts, "dev", "vite dev", `--host ${host} --port ${port}`);
+  }
+  if (deps["@angular/cli"] || deps["@angular/core"]) return `npx ng serve --host ${host} --port ${port}`;
+  if (deps["@ionic/react"] || deps["@ionic/vue"] || deps["@ionic/angular"]) {
+    return scriptOrBin(scripts, "start", "ionic serve", `--host ${host} --port ${port}`);
+  }
+  if (deps["@storybook/react"] || deps.storybook) {
+    return scriptOrBin(scripts, "storybook", "storybook dev", `--host ${host} --port ${port}`);
+  }
+  return undefined;
+}
+
+function scriptCommand(
+  scripts: Record<string, string>,
+  host: string,
+  port: number,
+): string | undefined {
+  const script = ["web", "dev", "start", "serve", "preview", "storybook"].find((name) => scripts[name]);
+  if (!script) return undefined;
+  return `npm run ${script} -- --host ${host} --port ${port}`;
+}
+
+function scriptOrBin(
+  scripts: Record<string, string>,
+  script: string,
+  bin: string,
+  args: string,
+): string {
+  return scripts[script] ? `npm run ${script} -- ${args}` : `npx ${bin} ${args}`;
+}
+
+function detectFrontendKind(deps: Record<string, string>, scripts: Record<string, string>): string {
+  if (deps.expo || deps["expo-router"]) return "expo";
+  if (deps.next) return "next";
+  if (deps.vite) return "vite";
+  if (deps.astro) return "astro";
+  if (deps.nuxt || deps.nuxt3) return "nuxt";
+  if (deps["@sveltejs/kit"] || deps.svelte) return "svelte";
+  if (deps["@angular/core"]) return "angular";
+  if (deps["@ionic/react"] || deps["@ionic/vue"] || deps["@ionic/angular"]) return "ionic";
+  if (scripts.storybook || deps.storybook) return "storybook";
+  return "frontend";
+}
+
+async function resolveStaticFile(requested: string, root: string): Promise<string | undefined> {
+  const stat = await fs.stat(requested).catch(() => undefined);
+  if (stat?.isFile()) return requested;
+  if (stat?.isDirectory() && await exists(path.join(requested, "index.html"))) {
+    return path.join(requested, "index.html");
+  }
+  const fallback = path.join(root, "index.html");
+  return (await exists(fallback)) ? fallback : undefined;
+}
+
+function contentType(file: string): string {
+  const ext = path.extname(file).toLowerCase();
+  if (ext === ".html") return "text/html; charset=utf-8";
+  if (ext === ".js" || ext === ".mjs") return "text/javascript; charset=utf-8";
+  if (ext === ".css") return "text/css; charset=utf-8";
+  if (ext === ".json") return "application/json; charset=utf-8";
+  if (ext === ".svg") return "image/svg+xml";
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  return "application/octet-stream";
+}
+
+async function readJson<T>(file: string): Promise<T | undefined> {
+  try {
+    return JSON.parse(await fs.readFile(file, "utf8")) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+async function exists(file: string): Promise<boolean> {
+  try {
+    await fs.access(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function defaultConfig(input: {
   name: string;
   runtime: "js" | "python";
@@ -256,6 +566,10 @@ function inferRuntime(source: string): "js" | "python" {
 function inferName(source: string): string {
   const parsed = path.parse(path.resolve(source));
   const raw = parsed.ext ? parsed.name : parsed.base;
+  return sanitizeName(raw);
+}
+
+function sanitizeName(raw: string): string {
   return raw.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "capsule";
 }
 

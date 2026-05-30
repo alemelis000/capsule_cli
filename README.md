@@ -99,8 +99,25 @@ capsule local deploy . --name my-app --port 3001
 capsule up ./agent.py
 ```
 
-Each local instance gets its own directory and persistent DB under `~/.capsule/instances/<name>`.
-Stop the foreground process with `Ctrl+C`.
+The local adapter is automatic:
+
+- Capsule/WASM projects use the sandboxed Capsule runtime.
+- Frontend projects use their local dev server when `package.json` is present.
+- Static sites are served directly when `index.html` is present.
+
+Supported frontend detection includes Expo, Next.js, Vite, Astro, Nuxt, SvelteKit, Angular, Ionic,
+Storybook, and any project exposing `web`, `dev`, `start`, `serve`, `preview`, or `storybook`
+scripts.
+
+```bash
+capsule local deploy . --port 8082
+capsule local deploy . --adapter frontend --port 3000
+capsule local deploy ./dist --adapter static --port 4173
+capsule local deploy . --command "npm run custom-dev -- --host {host} --port {port}"
+```
+
+Each local instance gets its own directory under `~/.capsule/instances/<name>`. WASM capsules also
+get their own persistent DB there. Stop the foreground process with `Ctrl+C`.
 
 `capsule local ps`
 

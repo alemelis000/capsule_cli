@@ -74,6 +74,8 @@ local
   .option("--runtime <runtime>", "js | python")
   .option("--host <host>", "bind host", "127.0.0.1")
   .option("-p, --port <port>", "bind port", "8787")
+  .option("--adapter <adapter>", "auto | wasm | frontend | static", "auto")
+  .option("--command <command>", "custom frontend command; supports {host}, {port}, {url}")
   .action(async (source, opts) => guard(() => localDeployCommand(source, opts)));
 
 local
@@ -95,6 +97,8 @@ program
   .option("--runtime <runtime>", "js | python")
   .option("--host <host>", "bind host", "127.0.0.1")
   .option("-p, --port <port>", "bind port", "8787")
+  .option("--adapter <adapter>", "auto | wasm | frontend | static", "auto")
+  .option("--command <command>", "custom frontend command; supports {host}, {port}, {url}")
   .action(async (source, opts) => guard(() => localDeployCommand(source, opts)));
 
 program.parseAsync(process.argv);
