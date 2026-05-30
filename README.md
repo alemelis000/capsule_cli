@@ -5,6 +5,8 @@ Deploy AI agents and WebAssembly apps to Capsule Cloud from a file, a folder, or
 This repository contains the standalone open-core Capsule CLI. It gives developers a local-first
 workflow with isolated free instances, plus zero-config deploys to the managed cloud.
 
+Website: [https://capsule.dev](https://capsule.dev)
+
 ## Install
 
 ```bash
@@ -42,7 +44,8 @@ Deploy from a Git repository:
 capsule deploy --repo https://github.com/acme/support-agent
 ```
 
-After a successful deploy, Capsule prints the production endpoint:
+After a successful deploy through [capsule.dev](https://capsule.dev), Capsule prints the production
+endpoint:
 
 ```bash
 https://support-agent.capsule.app
