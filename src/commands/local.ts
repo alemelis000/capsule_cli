@@ -426,7 +426,10 @@ function frameworkCommand(
   host: string,
   port: number,
 ): string | undefined {
-  if (deps.expo || deps["expo-router"]) return `npx expo start --web --port ${port} --host ${host}`;
+  if (deps.expo || deps["expo-router"]) {
+    const expoHost = host === "127.0.0.1" ? "localhost" : host;
+    return `npx expo start --web --port ${port} --host ${expoHost}`;
+  }
   if (deps.next) return scriptOrBin(scripts, "dev", "next dev", `-H ${host} -p ${port}`);
   if (deps.vite || deps["@vitejs/plugin-react"] || deps["@vitejs/plugin-vue"]) {
     return scriptOrBin(scripts, "dev", "vite", `--host ${host} --port ${port}`);
